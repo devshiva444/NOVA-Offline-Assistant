@@ -1,0 +1,10 @@
+customtkinter==5.2.2
+requests==2.32.3
+SpeechRecognition==3.14.2
+PyPDF2==3.0.1
+pillow==11.2.1
+python-dotenv
+pyaudio
+pyttsx3
+vosk
+faster-whisper

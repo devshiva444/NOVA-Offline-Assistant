@@ -1,0 +1,13 @@
+.env
+nova_env/
+__pycache__/
+llama/
+models/
+*.gguf
+memory.db
+llama_debug.log
+ai 001.zip
+ai002.zip
+ai003.zip
+ai004.zip
+ai005.zip
