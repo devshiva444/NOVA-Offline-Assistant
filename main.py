@@ -1,18 +1,15 @@
 from __future__ import annotations
-
 from tkinter import filedialog, Scrollbar
 import threading
 import time
 from datetime import datetime
 import re
-
 import customtkinter as ctk
 from PIL import Image, ImageSequence
 from dotenv import load_dotenv
 from PyPDF2 import PdfReader
-
-# Local project imports
-from audio_utils import listen, speak
+from audio_utils import listen, speak, stop_tts, is_audio_playing
+from automation import get_system_stats, open_application, close_application, play_on_youtube, lock_system
 from memory import SQLiteMemory
 from local_llm import ask_llm
 
@@ -27,7 +24,7 @@ is_processing: bool = False
 stop_event = threading.Event()
 needs_prefix = False
 voice_mode = False
-
+sentence_buffer = ""
 load_dotenv()
 
 # ----------------- UI THEME SETUP ----------------- #
@@ -210,7 +207,7 @@ def add_message(sender: str, text: str):
 
 
 def on_update_partial(chunk: str):
-    global needs_prefix
+    global needs_prefix, sentence_buffer, voice_mode
     try:
         chat_display.configure(state="normal")
         if needs_prefix:
@@ -220,6 +217,22 @@ def on_update_partial(chunk: str):
         chat_display.insert("end", chunk, "NOVA")
         chat_display.configure(state="disabled")
         chat_display.see("end")
+
+        # --- NEW REAL-TIME VOICE LOGIC ---
+        if voice_mode and not stop_event.is_set():
+            sentence_buffer += chunk
+            if any(p in chunk for p in ['.', '!', '?', '\n']):
+                import re
+                parts = re.split(r'([.!?\n]+)', sentence_buffer)
+                
+                if len(parts) > 1:
+                    complete_sentence = "".join(parts[:-1]).strip()
+                    if complete_sentence:
+                        clean_text = complete_sentence.replace('*', '').replace('#', '').replace('_', '')
+                        if any(c.isalnum() for c in clean_text):
+                            speak(clean_text)  
+                    sentence_buffer = parts[-1]  
+
     except Exception:
         pass
 
@@ -261,18 +274,15 @@ def toggle_mic():
         mic_btn.configure(fg_color="#0b1320", text_color=TEXT_ACCENT, text="MIC: OFF [🎤]")
 
 def toggle_voice_mode():
-    global voice_mode, is_listening
-
+    global voice_mode 
     voice_mode = not voice_mode
 
     if voice_mode:
-        is_listening = True
         voice_btn.configure(text="VOICE: ON 🔊", fg_color="#00ffcc")
         add_message("System", "Voice mode activated")
         speak("Voice mode activated")
-        threading.Thread(target=voice_input_loop, daemon=True).start()
+       
     else:
-        is_listening = False
         voice_btn.configure(text="VOICE: OFF 🔇", fg_color="#0b1320")
         add_message("System", "Voice mode disabled")
 
@@ -470,6 +480,7 @@ def _build_recent_conversation_block() -> str:
 
 def stop_generation():
     stop_event.set()
+    stop_tts() 
     add_message("System", "Generation halted by user override.")
 
 
@@ -526,14 +537,68 @@ def send_message():
 send_btn.configure(command=send_message)
 
 def process_message(message: str):
-    global uploaded_context, conversation_history, needs_prefix, session_vars, voice_mode
+    # NAYA: yahan sentence_buffer add kiya hai
+    global uploaded_context, conversation_history, needs_prefix, session_vars, voice_mode, sentence_buffer
     try:
         stop_event.clear()
         set_processing(True)
         needs_prefix = True
+        sentence_buffer = "" 
 
-        msg_lower = (message or "").strip()
+        msg_lower = (message or "").strip().lower()
 
+        # ===== AUTOMATION HANDLERS =====
+        
+        # 1. System Status
+        if "system status" in msg_lower or "battery" in msg_lower:
+            response = get_system_stats()
+            add_message("NOVA", response)
+            conversation_history.append({"role": "user", "text": message})
+            conversation_history.append({"role": "assistant", "text": response})
+            if voice_mode:
+                speak(response)
+            return
+            
+        # 2. App Launcher (Dynamic)
+        if msg_lower.startswith("open "):
+            app_to_open = msg_lower.replace("open ", "")
+            response = open_application(app_to_open)
+            
+            add_message("NOVA", response)
+            conversation_history.append({"role": "user", "text": message})
+            conversation_history.append({"role": "assistant", "text": response})
+            if voice_mode:
+                speak(response)
+            return
+
+        # BONUS: App Closer (Dynamic)
+        if msg_lower.startswith("close "):
+            app_to_close = msg_lower.replace("close ", "")
+            response = close_application(app_to_close)
+            
+            add_message("NOVA", response)
+            conversation_history.append({"role": "user", "text": message})
+            conversation_history.append({"role": "assistant", "text": response})
+            if voice_mode:
+                speak(response)
+            return
+
+        # 3. YouTube Play
+        if "play" in msg_lower and "youtube" in msg_lower:
+            response = play_on_youtube(msg_lower)
+            add_message("NOVA", response)
+            if voice_mode:
+                speak(response)
+            return
+            
+        # 4. System Lock
+        if "lock pc" in msg_lower or "lock system" in msg_lower:
+            response = lock_system()
+            add_message("NOVA", response)
+            if voice_mode:
+                speak(response)
+            return
+        
         # ===== NAME MEMORY =====
         if re.search(r"\b(what\s+is\s+my\s+name|who\s+am\s+i|my\s+name\s+is\s+what)\b", msg_lower, flags=re.IGNORECASE):
             try:
@@ -606,13 +671,17 @@ def process_message(message: str):
                 pass
 
         # ===== SEND TO LLM =====
-        context = uploaded_context or ""
+        context_block = ""
+        if uploaded_context:
+            # Explicitly tell the LLM this is a document to read
+            context_block = f"--- UPLOADED DOCUMENT CONTENT (Read this carefully) ---\n{uploaded_context}\n----------------------------------------------------\n\n"
+
         recent_convo = _build_recent_conversation_block()
 
         if recent_convo:
-            prompt = f"{context}\n\nRECENT CONTEXT:\n{recent_convo}\nUser: {message}"
+            prompt = f"{context_block}RECENT CONTEXT:\n{recent_convo}\nUser Question: {message}"
         else:
-            prompt = f"{context}\n\nUser: {message}"
+            prompt = f"{context_block}User Question: {message}"
 
         conversation_history.append({"role": "user", "text": message})
 
@@ -628,9 +697,19 @@ def process_message(message: str):
         )
 
         # 🔥 VOICE OUTPUT
-        if voice_mode and response:
-            speak(response)
+        if voice_mode and sentence_buffer.strip() and not stop_event.is_set():
+            clean_text = sentence_buffer.strip().replace('*', '').replace('#', '').replace('_', '')
+            if any(c.isalnum() for c in clean_text):
+                speak(clean_text)
+            sentence_buffer = ""
 
+        # ====================================================
+        # NAYA FIX: Audio khatam hone tak STOP button ko roke rakhna
+        # ====================================================
+        if voice_mode:
+            while is_audio_playing() and not stop_event.is_set():
+                time.sleep(0.2)
+                
         # ===== ERROR HANDLING =====
         if not response or response.startswith("Error:") or response.startswith("Connection"):
             if not response:
@@ -658,146 +737,6 @@ def process_message(message: str):
 
     finally:
         set_processing(False)
-
-# def process_message(message: str):
-#     global uploaded_context, conversation_history, needs_prefix, session_vars
-#     try:
-#         stop_event.clear()
-#         set_processing(True)
-#         needs_prefix = True
-
-#         msg_lower = (message or "").strip()
-
-#         # ===== RETRIEVAL HANDLERS =====
-#         if re.search(r"\b(what\s+is\s+my\s+name|who\s+am\s+i|my\s+name\s+is\s+what)\b", msg_lower, flags=re.IGNORECASE):
-#             try:
-#                 stored_name = memory.get_user_name("default_user")
-#             except Exception:
-#                 stored_name = None
-#             if stored_name:
-#                 add_message("NOVA", f"Your name is {stored_name}.")
-#             else:
-#                 add_message("NOVA", "I don't know your name yet. Please tell me your name.")
-#             conversation_history.append({"role": "user", "text": message})
-#             conversation_history.append({"role": "assistant", "text": stored_name or "(unknown)"})
-#             return
-
-#         if re.search(r"\b(what\s+is\s+my\s+friend|friend'?s?\s+name|my\s+friend\s+name\s+is\s+what)\b", msg_lower, flags=re.IGNORECASE):
-#             friend_stored = session_vars.get("friend_name", None)
-#             if friend_stored:
-#                 add_message("NOVA", f"Your friend's name is {friend_stored}.")
-#                 response_text = str(friend_stored)
-#             else:
-#                 add_message("NOVA", "You haven't told me your friend's name yet.")
-#                 response_text = "(unknown)"
-#             conversation_history.append({"role": "user", "text": message})
-#             conversation_history.append({"role": "assistant", "text": response_text})
-#             return
-
-#         # ===== EXTRACTION & ASSIGNMENT HANDLERS =====
-#         if not re.search(r"\bwhat\b", msg_lower):
-#             m = re.search(r"\bmy name is ([A-Za-z0-9_\-]+)\b", msg_lower, flags=re.IGNORECASE)
-#             if not m:
-#                 m = re.search(r"\bi am ([A-Za-z0-9_\-]+)\b", msg_lower, flags=re.IGNORECASE)
-#             if m:
-#                 name = m.group(1).strip()
-#                 try:
-#                     memory.set_user_name("default_user", name)
-#                 except Exception:
-#                     pass
-#                 add_message("NOVA", f"Thik hai, {name}! I've noted that.")
-#                 conversation_history.append({"role": "user", "text": message})
-#                 conversation_history.append({"role": "assistant", "text": f"Remembered: {name}"})
-#                 return
-
-#         if not re.search(r"\bwhat\b", msg_lower):
-#             m_friend = re.search(r"\bmy friend name is ([A-Za-z0-9_\-]+)\b", msg_lower, flags=re.IGNORECASE)
-#             if not m_friend:
-#                 m_friend = re.search(r"\b([A-Za-z0-9_\-]+)\s+is my friend\b", msg_lower, flags=re.IGNORECASE)
-#             if m_friend:
-#                 friend_name = m_friend.group(1).strip()
-#                 session_vars["friend_name"] = friend_name
-#                 add_message("NOVA", f"Got it! Your friend is {friend_name}. Noted!")
-#                 conversation_history.append({"role": "user", "text": message})
-#                 conversation_history.append({"role": "assistant", "text": f"Friend: {friend_name}"})
-#                 return
-
-#         m_var = re.match(r"^\s*([a-zA-Z]\w*)\s*=\s*([+-]?\d+(?:\.\d+)?)\s*$", message)
-#         if m_var:
-#             var = m_var.group(1)
-#             val = float(m_var.group(2)) if "." in m_var.group(2) else int(m_var.group(2))
-#             session_vars[var] = val
-#             add_message("NOVA", f"Set {var} = {val}")
-#             conversation_history.append({"role": "user", "text": message})
-#             conversation_history.append({"role": "assistant", "text": f"Set {var} = {val}"})
-#             return
-
-#         m_expr = re.search(
-#             r"([a-zA-Z]\w*(?:\s*[+\-*/]\s*[a-zA-Z]\w*)+)(?:\s*=\s*\?|\?)",
-#             message,
-#             flags=re.IGNORECASE,
-#         )
-#         if m_expr:
-#             expr_raw = m_expr.group(1).replace(" ", "")
-#             expr = expr_raw
-#             for v in list(session_vars.keys()):
-#                 if v != "friend_name":
-#                     expr = re.sub(rf"\b{v}\b", str(session_vars[v]), expr)
-#             try:
-#                 if re.match(r"^[0-9+\-*/(). ]+$", expr):
-#                     result = eval(expr)
-#                     add_message("NOVA", f"{expr_raw} = {result}")
-#                     conversation_history.append({"role": "user", "text": message})
-#                     conversation_history.append({"role": "assistant", "text": str(result)})
-#                     return
-#             except Exception:
-#                 pass
-
-#         # ===== SEND TO LLM =====
-#         context = uploaded_context or ""
-#         recent_convo = _build_recent_conversation_block()
-
-#         if recent_convo:
-#             prompt = f"{context}\n\nRECENT CONTEXT:\n{recent_convo}\nUser: {message}"
-#         else:
-#             prompt = f"{context}\n\nUser: {message}"
-
-#         conversation_history.append({"role": "user", "text": message})
-#         if len(conversation_history) > 20:
-#             conversation_history = conversation_history[-20:]
-
-#         response = ask_llm(
-#             prompt,
-#             memory,
-#             conversation_history,
-#             on_update=on_update_partial,
-#             stop_event=stop_event,
-#         )
-#         if voice_mode and response:
-#             speak(response)
-
-#         if not response or response.startswith("Error:") or response.startswith("Connection"):
-#             if not response:
-#                 response = "I'm having trouble responding. Please try again."
-#             add_message("System", response)
-
-#         chat_display.configure(state="normal")
-#         chat_display.insert("end", "\n\n")
-#         chat_display.configure(state="disabled")
-
-#         conversation_history.append({"role": "assistant", "text": response})
-#         resp_clean = (response or "").strip()
-#         if resp_clean and len(resp_clean) > 5:
-#             try:
-#                 memory.save_memory("default_user", message, resp_clean)
-#             except Exception:
-#                 pass
-
-#     except Exception as e:
-#         add_message("System", f"Error: {e}")
-#     finally:
-#         set_processing(False)
-
 
 def _continue_worker(followup_text: str, on_update_cb):
     global needs_prefix
@@ -836,37 +775,20 @@ def _continue_worker(followup_text: str, on_update_cb):
 
 # ----------------- VOICE ----------------- #
 def voice_input_loop():
-    global is_listening, voice_mode
+    global is_listening 
 
-    while is_listening and voice_mode:
+    while is_listening:
         try:
             cmd = listen()
-
             if not cmd:
                 continue
-
             add_message("You", cmd)
-
-            #  LLM CALL
-            response = ask_llm(
-                cmd,
-                memory,
-                conversation_history
-            )
-
-            if response:
-                add_message("NOVA", response)
-
-                # SPEAK ONLY IN VOICE MODE
-                if voice_mode:
-                    speak(response)
+            process_message(cmd)
 
         except Exception as e:
             add_message("System", f"Voice error: {e}")
 
         time.sleep(0.2)
-
-
 message_entry.bind("<Return>", lambda e: send_message())
 
 # ----------------- ANIMATIONS ----------------- #

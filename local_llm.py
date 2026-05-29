@@ -21,6 +21,8 @@ LLAMA_BIN_DIR = os.environ.get("LLAMA_BIN_DIR", os.path.join("llama", "bin"))
 MODEL_PATH = os.path.join(BASE_DIR, MODELS_DIR, LLM_MODEL_NAME)
 LLAMA_PATH = os.path.join(BASE_DIR, LLAMA_BIN_DIR)
 API_URL = os.environ.get("LOCAL_LLM_API", f"http://127.0.0.1:{LLM_PORT}")
+PROMPTS_DIR = os.path.join(BASE_DIR, "prompts")
+IDENTITY_FILE = os.path.join(PROMPTS_DIR, "identity.md")
 
 def _log_debug(entry: str):
     try:
@@ -29,9 +31,24 @@ def _log_debug(entry: str):
     except Exception:
         pass
 
+def get_identity():
+    """Reads the AI identity from identity.md. Fallback to default if missing."""
+    if os.path.exists(IDENTITY_FILE):
+        try:
+            with open(IDENTITY_FILE, "r", encoding="utf-8") as f:
+                content = f.read().strip()
+                if content:
+                    return content
+        except Exception as e:
+            _log_debug(f"Error reading identity.md: {e}")
+    
+    # Default fallback if file is missing or empty
+    # return "You are Nova, an advanced and highly capable AI assistant. Provide clear, direct, and concise answers."
+    return "You are NOVA, a fully offline AI assistant created by Shivraj Selar, Vivek Kevat, and Kartik Kewat for Government Polytechnic College Raghogarh."
+    
+
 def build_prompt(user_input, memory, conversation_history):
-    identity = "You are Jarvis AI, a concise helpful offline assistant."
-    instruction = "Answer briefly in Hinglish (1-3 sentences). For 'name' questions, answer directly. Do NOT ask back."
+    identity = get_identity()
 
     uname = None
     try:
@@ -51,16 +68,20 @@ def build_prompt(user_input, memory, conversation_history):
             if re.search(r"\bmemory\b|saved memory|q:\s|a:\s|\<\|im_start\|\>", text, flags=re.IGNORECASE):
                 continue
             text = " ".join(text.split())
-            convo_lines.append(f"{role.capitalize()}: {text}")
+            
+            # Ensure roles align correctly
+            role_name = "NOVA" if role.lower() == "assistant" else "User"
+            convo_lines.append(f"{role_name}: {text}")
 
     conv_block = "\n".join(convo_lines)
-    name_line = f"User name: {uname}\n" if uname else ""
+    name_line = f"The user's name is: {uname}\n" if uname else ""
 
-    prompt = identity + "\n" + instruction + "\n" + name_line
+    prompt = f"{identity}\n{name_line}"
     if conv_block:
-        prompt += "\nRecent conversation:\n" + conv_block + "\n"
+        prompt += f"\nRecent conversation:\n{conv_block}\n"
 
-    prompt += f"\nUser: {user_input}\nJarvis:"
+    # Fixed typo from \Nova: to \nNOVA:
+    prompt += f"\nUser: {user_input}\nNOVA:"
     return prompt
 
 def build_system_context(user_input, memory, conversation_history):
@@ -70,10 +91,10 @@ def build_system_context(user_input, memory, conversation_history):
             uname = memory.get_user_name("default_user")
     except Exception:
         uname = None
-
-    base = "You are Jarvis, a helpful AI. Answer in simple Hinglish. Keep it extremely concise and do not repeat yourself."
+    base = get_identity()
+    base += "\nIMPORTANT RULE: If the user provides 'UPLOADED DOCUMENT CONTENT', you MUST read it and answer based ONLY on that text."
     if uname:
-        base = f"{base} The user's name is {uname}."
+        base = f"{base}\nThe user's name is {uname}."
     return base
 
 def _find_llama_executable():
@@ -83,26 +104,21 @@ def _find_llama_executable():
         os.path.join(LLAMA_PATH, "llama-cli.exe"),
         os.path.join(LLAMA_PATH, "llama.exe"),
     ]
-    # fallback to PATH
     for name in ("llama-server-cpu.exe", "llama-server.exe", "llama-cli", "llama"):
         which = shutil.which(name)
         if which:
             return which
-
     return None
 
 def ask_llm(user_input, memory=None, conversation_history=None, on_update=None, stop_event=None):
-   
     prompt = build_prompt(user_input, memory, conversation_history)
     system_context = build_system_context(user_input, memory, conversation_history)
 
-    # 1) Try local HTTP server (fast if you run a llama server)
     try:
-        timeout_http = int(os.environ.get("LOCAL_LLM_HTTP_TIMEOUT", "300")) # NAYA FIX: Timeout 20 se 300 seconds
+        timeout_http = int(os.environ.get("LOCAL_LLM_HTTP_TIMEOUT", "300")) 
         use_chat_api = os.environ.get("LOCAL_LLM_USE_CHAT_API", "1") in ("1", "true", "True")
 
         if use_chat_api:
-            # MISSING `payload = {` HAS BEEN FIXED HERE 👇
             payload = {
                 "model": os.environ.get("LLM_MODEL_NAME", ""),
                 "messages": [
@@ -110,10 +126,11 @@ def ask_llm(user_input, memory=None, conversation_history=None, on_update=None, 
                     {"role": "user", "content": user_input}
                 ],
                 "max_tokens": 512,
-                "temperature": 0.2, # Low temp = less hallucination
-                "top_p": 0.9,
-                "frequency_penalty": 1.15, # Ye naya penalty isko ek baat baar-baar bolne se rokega
-                "stop": ["User:", "Assistant:", "<|im_end|>", "</s>", "\n\nUser:"] # Strict Stops
+                "temperature": 0.1,  
+                "top_p": 0.85,
+                "frequency_penalty": 1.2, 
+                "presence_penalty": 1.2, 
+                "stop": ["User:", "Assistant:", "NOVA:", "<|im_end|>", "</s>", "\n\nUser:"] 
             }
             
             stream_enabled = os.environ.get("LOCAL_LLM_STREAM", "1") in ("1", "true", "True")
@@ -132,7 +149,6 @@ def ask_llm(user_input, memory=None, conversation_history=None, on_update=None, 
                     final_text = ""
                     try:
                         for line in resp.iter_lines(decode_unicode=True):
-                            # NAYA FIX: Handle STOP Event Properly!
                             if stop_event and stop_event.is_set():
                                 resp.close()
                                 if on_update: on_update("\n[STOPPED BY USER]")
@@ -159,7 +175,6 @@ def ask_llm(user_input, memory=None, conversation_history=None, on_update=None, 
                 else:
                     return f"LLM server error: {resp.status_code}"
             else:
-                # Non-streaming path fallback
                 resp = requests.post(url, json=payload, timeout=timeout_http)
                 if resp.status_code == 200:
                     j = resp.json()
@@ -189,6 +204,202 @@ def _post_process(text: str, user_input: str) -> str:
     cleaned = re.sub(r'\s+', ' ', cleaned).strip()
     result = cleaned or text.strip()
     return result if result else "(no response)"
+
+
+
+
+# working
+# import os
+# import shutil
+# import subprocess
+# import requests
+# from datetime import datetime
+# from dotenv import load_dotenv
+
+# BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+
+# # Load runtime configuration from .env (if present)
+# load_dotenv()
+
+# # Configurable via .env
+# MODELS_DIR = os.environ.get("MODELS_DIR", "models")
+# LLM_MODEL_NAME = os.environ.get("LLM_MODEL_NAME", "sarvam-1-2b-instruct-q8_0.gguf")
+# LLM_CONTEXT = int(os.environ.get("LLM_CONTEXT", os.environ.get("LOCAL_LLM_CTX", "2048")))
+# LLM_THREADS = int(os.environ.get("LLM_THREADS", os.environ.get("LOCAL_LLM_THREADS", "4")))
+# LLM_PORT = int(os.environ.get("LLM_PORT", os.environ.get("LOCAL_LLM_PORT", "8080")))
+# LLAMA_BIN_DIR = os.environ.get("LLAMA_BIN_DIR", os.path.join("llama", "bin"))
+
+# MODEL_PATH = os.path.join(BASE_DIR, MODELS_DIR, LLM_MODEL_NAME)
+# LLAMA_PATH = os.path.join(BASE_DIR, LLAMA_BIN_DIR)
+# API_URL = os.environ.get("LOCAL_LLM_API", f"http://127.0.0.1:{LLM_PORT}")
+
+# def _log_debug(entry: str):
+#     try:
+#         with open(os.path.join(BASE_DIR, "llama_debug.log"), "a", encoding="utf-8") as fh:
+#             fh.write(f"{datetime.now().isoformat()} - {entry}\n")
+#     except Exception:
+#         pass
+
+# def build_prompt(user_input, memory, conversation_history):
+#     identity = "You are Jarvis AI, a concise helpful offline assistant."
+#     instruction = "Answer briefly in Hinglish (1-3 sentences). For 'name' questions, answer directly. Do NOT ask back."
+
+#     uname = None
+#     try:
+#         if memory:
+#             uname = memory.get_user_name("default_user")
+#     except Exception:
+#         uname = None
+
+#     convo_lines = []
+#     if conversation_history:
+#         for msg in (conversation_history or [])[-6:]:
+#             role = msg.get("role", "user")
+#             text = (msg.get("text", "") or "").strip()
+#             if not text or len(text) > 800:
+#                 continue
+#             import re
+#             if re.search(r"\bmemory\b|saved memory|q:\s|a:\s|\<\|im_start\|\>", text, flags=re.IGNORECASE):
+#                 continue
+#             text = " ".join(text.split())
+#             convo_lines.append(f"{role.capitalize()}: {text}")
+
+#     conv_block = "\n".join(convo_lines)
+#     name_line = f"User name: {uname}\n" if uname else ""
+
+#     prompt = identity + "\n" + instruction + "\n" + name_line
+#     if conv_block:
+#         prompt += "\nRecent conversation:\n" + conv_block + "\n"
+
+#     prompt += f"\nUser: {user_input}\Nova:"
+#     return prompt
+
+# def build_system_context(user_input, memory, conversation_history):
+#     uname = None
+#     try:
+#         if memory:
+#             uname = memory.get_user_name("default_user")
+#     except Exception:
+#         uname = None
+
+#     base = "You are Nova, a helpful AI. Answer in simple Hinglish. Keep it extremely concise and do not repeat yourself."
+#     if uname:
+#         base = f"{base} The user's name is {uname}."
+#     return base
+
+# def _find_llama_executable():
+#     candidates = [
+#         os.path.join(LLAMA_PATH, "llama-server-cpu.exe"),
+#         os.path.join(LLAMA_PATH, "llama-server.exe"),
+#         os.path.join(LLAMA_PATH, "llama-cli.exe"),
+#         os.path.join(LLAMA_PATH, "llama.exe"),
+#     ]
+#     # fallback to PATH
+#     for name in ("llama-server-cpu.exe", "llama-server.exe", "llama-cli", "llama"):
+#         which = shutil.which(name)
+#         if which:
+#             return which
+
+#     return None
+
+# def ask_llm(user_input, memory=None, conversation_history=None, on_update=None, stop_event=None):
+   
+#     prompt = build_prompt(user_input, memory, conversation_history)
+#     system_context = build_system_context(user_input, memory, conversation_history)
+
+#     # 1) Try local HTTP server (fast if you run a llama server)
+#     try:
+#         timeout_http = int(os.environ.get("LOCAL_LLM_HTTP_TIMEOUT", "300")) # NAYA FIX: Timeout 20 se 300 seconds
+#         use_chat_api = os.environ.get("LOCAL_LLM_USE_CHAT_API", "1") in ("1", "true", "True")
+
+#         if use_chat_api:
+#             # MISSING `payload = {` HAS BEEN FIXED HERE 👇
+#             payload = {
+#                 "model": os.environ.get("LLM_MODEL_NAME", ""),
+#                 "messages": [
+#                     {"role": "system", "content": system_context},
+#                     {"role": "user", "content": user_input}
+#                 ],
+#                 "max_tokens": 512,
+#                 "temperature": 0.2, # Low temp = less hallucination
+#                 "top_p": 0.9,
+#                 "frequency_penalty": 1.15, # Ye naya penalty isko ek baat baar-baar bolne se rokega
+#                 "stop": ["User:", "Assistant:", "<|im_end|>", "</s>", "\n\nUser:"] # Strict Stops
+#             }
+            
+#             stream_enabled = os.environ.get("LOCAL_LLM_STREAM", "1") in ("1", "true", "True")
+#             url = API_URL.rstrip('/') + "/v1/chat/completions"
+            
+#             if stream_enabled:
+#                 payload["stream"] = True
+#                 try:
+#                     resp = requests.post(url, json=payload, timeout=timeout_http, stream=True)
+#                 except Exception as e:
+#                     _log_debug(f"HTTP stream error: {e}")
+#                     if on_update: on_update(f"\n[SERVER TIMEOUT/ERROR: Server peeche busy hai, please wait.]")
+#                     return f"Connection Error: {e}"
+
+#                 if resp is not None and resp.status_code == 200:
+#                     final_text = ""
+#                     try:
+#                         for line in resp.iter_lines(decode_unicode=True):
+#                             # NAYA FIX: Handle STOP Event Properly!
+#                             if stop_event and stop_event.is_set():
+#                                 resp.close()
+#                                 if on_update: on_update("\n[STOPPED BY USER]")
+#                                 break
+                                
+#                             if not line:
+#                                 continue
+#                             raw = line.decode('utf-8') if isinstance(line, bytes) else line
+#                             if raw.strip().startswith("data: "):
+#                                 raw = raw.split("data: ", 1)[1]
+#                             if raw.strip() in ("[DONE]", "[done]"):
+#                                 break
+#                             try:
+#                                 obj = __import__('json').loads(raw)
+#                                 chunk = obj.get('choices', [])[0].get('delta', {}).get('content', '') or ''
+#                                 if chunk:
+#                                     final_text += chunk
+#                                     if on_update:
+#                                         on_update(chunk)
+#                             except Exception:
+#                                 continue
+#                     finally:
+#                         return _post_process(final_text.strip(), user_input)
+#                 else:
+#                     return f"LLM server error: {resp.status_code}"
+#             else:
+#                 # Non-streaming path fallback
+#                 resp = requests.post(url, json=payload, timeout=timeout_http)
+#                 if resp.status_code == 200:
+#                     j = resp.json()
+#                     text = j.get('choices', [])[0].get('message', {}).get('content', '').strip()
+#                     return _post_process(text, user_input)
+#                 else:
+#                     return f"LLM server error: {resp.status_code}"
+
+#     except Exception as e:
+#         _log_debug(f"HTTP server error: {e}")
+#         return f"Error: {e}"
+
+# def _post_process(text: str, user_input: str) -> str:
+#     if not text: return "(no response)"
+#     import re
+#     for marker in ["<|im_start|>", "<|im_end|>", "<|start|>", "<|end|>", "[INST]", "[/INST]", "[START]", "[END]"]:
+#         text = text.replace(marker, "")
+#     lines = []
+#     for ln in text.splitlines():
+#         ln_strip = ln.strip()
+#         if not ln_strip: continue
+#         ln_lower = ln_strip.lower()
+#         if re.match(r'^(user|assistant|jarvis|nova|memory|q:|a:|loading|generation)\b', ln_lower): continue
+#         if re.search(r'\b(user|assistant|jarvis|nova)\s*:', ln_lower): continue
+#         lines.append(ln_strip)
+#     cleaned = "\n".join(lines).strip()
+#     cleaned = re.sub(r'\s+', ' ', cleaned).strip()
+#     result = cleaned or text.strip()
+#     return result if result else "(no response)"
 
 
 
